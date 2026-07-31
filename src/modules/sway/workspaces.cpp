@@ -5,8 +5,62 @@
 #include <algorithm>
 #include <cctype>
 #include <string>
+#include <tuple>
+#include <utility>
+
+#include "util/string.hpp"
 
 namespace waybar::modules::sway {
+
+namespace {
+
+// Returns {app_id, app_class} for a view. Native Wayland views carry an `app_id`; XWayland
+// views instead carry the X11 `instance` and `class` hints. The instance is used as the
+// displayed app_id (as sway/window does), but the class is carried along because it is the
+// identifier icon lookup actually needs: X11 Firefox reports instance "Navigator" and
+// class "firefox".
+std::pair<std::string, std::string> resolve_app_id(
+    const Json::Value& node, const std::map<std::string, std::string>& replace_map) {
+  std::string app_id;
+  std::string app_class;
+  if (node["window_properties"]["class"].isString()) {
+    app_class = node["window_properties"]["class"].asString();
+  }
+  if (node["app_id"].isString()) {
+    app_id = node["app_id"].asString();
+  } else if (node["window_properties"]["instance"].isString()) {
+    app_id = node["window_properties"]["instance"].asString();
+  } else {
+    app_id = app_class;
+  }
+
+  const auto replace = [&replace_map](std::string& value) {
+    const auto it = replace_map.find(value);
+    if (it != replace_map.end()) {
+      value = it->second;
+    }
+  };
+  replace(app_id);
+  replace(app_class);
+  return {app_id, app_class};
+}
+
+// A view with no children of its own. Unlike the predicate updateWindows() uses, this
+// matches nameless views but not named containers.
+bool is_leaf_view(const Json::Value& node) {
+  const auto type = node["type"].asString();
+  return (type == "con" || type == "floating_con") && node["nodes"].empty() &&
+         node["floating_nodes"].empty();
+}
+
+bool is_window_ignored(const std::vector<std::regex>& ignore_list, const WorkspaceWindow& window) {
+  return std::any_of(ignore_list.begin(), ignore_list.end(), [&window](const std::regex& rule) {
+    return std::regex_match(window.app_id, rule) || std::regex_match(window.app_class, rule) ||
+           std::regex_match(window.title, rule);
+  });
+}
+
+}  // namespace
 
 Gtk::Label& Workspaces::WorkspaceButton::labelWidget() {
   return *static_cast<Gtk::Label*>(button.get_children()[0]);
@@ -89,6 +143,7 @@ Workspaces::Workspaces(const std::string& id, const Bar& bar, const Json::Value&
         windowRewrite, std::move(windowRewriteDefault), windowRewritePriorityFunction);
   }
   populateIgnoreWorkspacesConfig(config);
+  populateWorkspaceTaskbarConfig(config);
   ipc_.subscribe(R"(["workspace"])");
   ipc_.subscribe(R"(["window"])");
   ipc_.signal_event.connect(sigc::mem_fun(*this, &Workspaces::onEvent));
@@ -133,6 +188,114 @@ auto Workspaces::populateIgnoreWorkspacesConfig(const Json::Value& config) -> vo
         spdlog::error("Not a string: '{}'", workspaceRegex);
       }
     }
+  }
+}
+
+auto Workspaces::populateWorkspaceTaskbarConfig(const Json::Value& config) -> void {
+  const Json::Value& taskbar = config["workspace-taskbar"];
+  if (!taskbar.isObject()) {
+    return;
+  }
+
+  taskbar_config_.enable = taskbar["enable"].isBool() && taskbar["enable"].asBool();
+  if (!taskbar_config_.enable) {
+    return;
+  }
+
+  if (taskbar["format"].isString()) {
+    auto parts = split(taskbar["format"].asString(), "{icon}", 1);
+    taskbar_config_.format_before = parts[0];
+    if (parts.size() > 1) {
+      taskbar_config_.with_icon = true;
+      taskbar_config_.format_after = parts[1];
+    }
+  } else {
+    // The default is to only show the icon.
+    taskbar_config_.with_icon = true;
+  }
+
+  if (!taskbar["tooltip"].isBool() || taskbar["tooltip"].asBool()) {
+    taskbar_config_.format_tooltip =
+        taskbar["tooltip-format"].isString() ? taskbar["tooltip-format"].asString() : "{title}";
+  }
+
+  if (taskbar["icon-size"].isInt()) {
+    taskbar_config_.icon_size = taskbar["icon-size"].asInt();
+  }
+  taskbar_config_.markup = taskbar["markup"].isBool() && taskbar["markup"].asBool();
+  taskbar_config_.rewrite = taskbar["rewrite"];
+
+  if (taskbar["icon-theme"].isArray()) {
+    for (const auto& theme : taskbar["icon-theme"]) {
+      if (theme.isString()) {
+        icon_loader_.add_custom_icon_theme(theme.asString());
+      } else {
+        spdlog::error("Not a string: '{}'", theme);
+      }
+    }
+  } else if (taskbar["icon-theme"].isString()) {
+    icon_loader_.add_custom_icon_theme(taskbar["icon-theme"].asString());
+  }
+
+  if (taskbar["ignore-list"].isArray()) {
+    for (const auto& rule : taskbar["ignore-list"]) {
+      if (!rule.isString()) {
+        spdlog::error("Not a string: '{}'", rule);
+        continue;
+      }
+      try {
+        taskbar_config_.ignore_list.emplace_back(rule.asString(), std::regex_constants::icase);
+      } catch (const std::regex_error& e) {
+        spdlog::error("Invalid rule {}: {}", rule.asString(), e.what());
+      }
+    }
+  }
+
+  if (taskbar["app_ids-mapping"].isObject()) {
+    const Json::Value& mapping = taskbar["app_ids-mapping"];
+    for (const auto& app_id : mapping.getMemberNames()) {
+      if (mapping[app_id].isString()) {
+        taskbar_config_.app_ids_replace.emplace(app_id, mapping[app_id].asString());
+      } else {
+        spdlog::error("Not a string: '{}'", mapping[app_id]);
+      }
+    }
+  }
+
+  // These keys are nested, so AModule (which only scans top-level keys) never sees them and
+  // will not also run them as shell commands. A top-level "on-click" on the module keeps
+  // behaving as a command, unchanged.
+  const auto read_action = [&taskbar](const char* key, std::string& out) {
+    if (taskbar[key].isString()) {
+      out = taskbar[key].asString();
+    }
+  };
+  read_action("on-click", taskbar_config_.on_click);
+  read_action("on-click-middle", taskbar_config_.on_click_middle);
+  read_action("on-click-right", taskbar_config_.on_click_right);
+}
+
+void Workspaces::collectWindows(const Json::Value& node, const WorkspaceTaskbarConfig& config,
+                                std::vector<WorkspaceWindow>& windows) {
+  if (is_leaf_view(node)) {
+    WorkspaceWindow window;
+    window.id = node["id"].asInt64();
+    window.title = node["name"].isString() ? node["name"].asString() : "";
+    std::tie(window.app_id, window.app_class) = resolve_app_id(node, config.app_ids_replace);
+    window.focused = node["focused"].asBool();
+    window.fullscreen = node["fullscreen_mode"].asInt() != 0;
+    window.urgent = node["urgent"].asBool();
+    if (!is_window_ignored(config.ignore_list, window)) {
+      windows.push_back(std::move(window));
+    }
+    return;
+  }
+
+  for (const Json::Value& child : node["nodes"]) {
+    collectWindows(child, config, windows);
+  }
+  for (const Json::Value& child : node["floating_nodes"]) {
+    collectWindows(child, config, windows);
   }
 }
 
@@ -281,6 +444,14 @@ void Workspaces::onCmd(const struct Ipc::ipc_response& res) {
 
                     return l < r;
                   });
+
+        workspace_windows_.clear();
+        if (taskbar_config_.enable) {
+          for (const auto& workspace : workspaces_) {
+            collectWindows(workspace, taskbar_config_,
+                           workspace_windows_[workspace["name"].asString()]);
+          }
+        }
       }
       dp.emit();
     } catch (const std::exception& e) {
