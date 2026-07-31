@@ -1,16 +1,22 @@
 #pragma once
 
 #include <fmt/format.h>
+#include <giomm/desktopappinfo.h>
+#include <glibmm/refptr.h>
+#include <gtkmm/box.h>
 #include <gtkmm/button.h>
+#include <gtkmm/image.h>
 #include <gtkmm/label.h>
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <regex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "AModule.hpp"
@@ -59,11 +65,83 @@ struct WorkspaceTaskbarConfig {
   std::string on_click_right;
 };
 
+class Workspaces;
+
+// One window of a workspace, rendered as a button nested inside that workspace's button.
+class WorkspaceWindowButton {
+ public:
+  WorkspaceWindowButton(Workspaces& owner, Gtk::Orientation orientation,
+                        const WorkspaceWindow& window);
+
+  int64_t id() const { return id_; }
+  Gtk::Button& widget() { return button_; }
+
+  // Refresh the cached snapshot, resolving the desktop entry if the window's identity
+  // changed. Only ever called from the main thread.
+  void setData(const WorkspaceWindow& window);
+  // Apply the cached snapshot to the icon, labels, tooltip and style classes. Must run
+  // with the button already packed: loading the icon reads the widget's scale factor,
+  // which is only correct once it has a parent.
+  void render();
+
+ private:
+  // The pieces of a window's snapshot that user format strings can interpolate.
+  struct FormatArgs {
+    std::string title;
+    std::string name;
+    std::string app_id;
+    std::string state;
+    std::string short_state;
+  };
+
+  std::string stateString(bool shortened) const;
+  // Expand one user-supplied format string. A malformed format makes fmt throw; this
+  // yields an empty string rather than letting the exception escape update().
+  std::string formatText(const std::string& format, const FormatArgs& args) const;
+  bool handleClicked(GdkEventButton* event);
+
+  Workspaces& owner_;
+  int64_t id_;
+
+  Gtk::Button button_;
+  Gtk::Box content_;
+  Gtk::Image icon_;
+  Gtk::Label text_before_;
+  Gtk::Label text_after_;
+
+  Glib::RefPtr<Gio::DesktopAppInfo> app_info_;
+  // False until setData() has resolved app_info_/name_ once, so a window whose app_id is
+  // empty still gets its initial resolution.
+  bool app_info_resolved_ = false;
+  // Set when app_info_ changed, cleared once render() has loaded the matching icon.
+  bool icon_dirty_ = false;
+  std::string name_;
+  std::string title_;
+  std::string app_id_;
+  std::string app_class_;
+  bool focused_ = false;
+  bool fullscreen_ = false;
+  bool urgent_ = false;
+};
+
 class Workspaces : public AModule, public sigc::trackable {
  public:
   Workspaces(const std::string&, const waybar::Bar&, const Json::Value&);
   ~Workspaces() override = default;
   auto update() -> void override;
+
+  // Used by the nested window buttons.
+  Ipc& ipc() { return ipc_; }
+  const IconLoader& iconLoader() const { return icon_loader_; }
+  const WorkspaceTaskbarConfig& taskbarConfig() const { return taskbar_config_; }
+  // Desktop entry for a window, memoised: the lookup scans desktop files, and a window
+  // moving between workspaces rebuilds its button.
+  Glib::RefPtr<Gio::DesktopAppInfo> resolveAppInfo(const std::string& app_id,
+                                                   const std::string& app_class);
+  // Warns at most once per module, however many windows share the malformed format. Called
+  // from update(), which runs from a Glib::Dispatcher callback where an escaping exception
+  // would terminate waybar.
+  void warnTaskbarFormat(const std::string& format, const std::string& error);
 
  private:
   static constexpr std::string_view workspace_switch_cmd_ = "workspace {} \"{}\"";
@@ -71,12 +149,26 @@ class Workspaces : public AModule, public sigc::trackable {
   static constexpr std::string_view persistent_workspace_switch_cmd_ =
       R"(workspace {} "{}"; move workspace to output "{}"; workspace {} "{}")";
 
-  // The button of a single workspace. Its text lives in the auto-created child label.
+  // The button of a single workspace. Without the taskbar its text lives in the button's
+  // auto-created child label; with the taskbar the button gets an explicit box holding the
+  // label and the window buttons instead.
+  //
+  // Never call Gtk::Button::set_label() on `button` once that explicit child exists --
+  // gtk_button_construct_child() would destroy it. Write text through labelWidget().
   struct WorkspaceButton {
-    explicit WorkspaceButton(const std::string& name) : button(name) {}
+    WorkspaceButton(const std::string& name, bool taskbar_enabled, Gtk::Orientation orientation);
     Gtk::Label& labelWidget();
 
     Gtk::Button button;
+    // Only parented when taskbar_mode is set; otherwise they are constructed and left
+    // unused, which is cheaper than making them conditionally allocated.
+    Gtk::Box content;
+    Gtk::Label label;
+    Gtk::Box taskbar;
+    bool taskbar_mode = false;
+    // Declared last so it is destroyed first: each window button unparents itself from
+    // `taskbar`, which must still be alive at that point.
+    std::vector<std::unique_ptr<WorkspaceWindowButton>> windows;
   };
 
   static int convertWorkspaceNameToNum(const std::string& name);
@@ -86,6 +178,7 @@ class Workspaces : public AModule, public sigc::trackable {
   auto populateWorkspaceTaskbarConfig(const Json::Value& config) -> void;
   static void collectWindows(const Json::Value& node, const WorkspaceTaskbarConfig& config,
                              std::vector<WorkspaceWindow>& windows);
+  void updateWorkspaceTaskbar(WorkspaceButton& ws, const std::string& name);
   bool isWorkspaceIgnored(std::string const& name);
   void onCmd(const struct Ipc::ipc_response&);
   void onEvent(const struct Ipc::ipc_response&);
@@ -119,6 +212,8 @@ class Workspaces : public AModule, public sigc::trackable {
   // Windows of each workspace, keyed by workspace name. Rebuilt by onCmd() and consumed by
   // update(); guarded by mutex_ alongside workspaces_, which it is derived from.
   std::unordered_map<std::string, std::vector<WorkspaceWindow>> workspace_windows_;
+  std::map<std::pair<std::string, std::string>, Glib::RefPtr<Gio::DesktopAppInfo>> app_info_cache_;
+  bool taskbar_format_warned_ = false;
   std::unordered_map<std::string, uint16_t> custom_sort_priorities_;
   std::mutex mutex_;
   Ipc ipc_;
