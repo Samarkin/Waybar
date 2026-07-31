@@ -157,8 +157,16 @@ Additional to workspace name matching, the following *format-icons* can be set.
 - *default*: Will be shown, when no string matches are found.
 - *urgent*: Will be shown, when workspace is flagged as urgent
 - *focused*: Will be shown, when workspace is focused
+- *empty*: Will be shown, when workspace contains no windows
+- *visible*: Will be shown, when workspace is visible on its output
 - *persistent*: Will be shown, when workspace is persistent.
 - *high-priority-named*: Icons by names will be shown always for those workspaces, independent by state.
+
+Icons are checked in the order *high-priority-named*, *persistent*, *urgent*, *focused*,
+*empty*, *visible*, then a workspace name match, and finally *default*.
+
+*empty* deliberately ranks above *visible*: sway only keeps an empty workspace in the tree
+while it is the one displayed on its output, so an empty workspace is always visible too.
 
 # PERSISTENT WORKSPACES
 
