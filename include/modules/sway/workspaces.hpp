@@ -29,6 +29,14 @@ class Workspaces : public AModule, public sigc::trackable {
   static constexpr std::string_view persistent_workspace_switch_cmd_ =
       R"(workspace {} "{}"; move workspace to output "{}"; workspace {} "{}")";
 
+  // The button of a single workspace. Its text lives in the auto-created child label.
+  struct WorkspaceButton {
+    explicit WorkspaceButton(const std::string& name) : button(name) {}
+    Gtk::Label& labelWidget();
+
+    Gtk::Button button;
+  };
+
   static int convertWorkspaceNameToNum(const std::string& name);
   static int windowRewritePriorityFunction(std::string const& window_rule);
 
@@ -42,8 +50,8 @@ class Workspaces : public AModule, public sigc::trackable {
   static bool isWorkspaceVisible(const Json::Value&);
   static bool hasState(const Json::Value&, const std::string&);
   void updateWindows(const Json::Value&, std::string&);
-  Gtk::Button& addButton(const Json::Value&);
-  void onButtonReady(const Json::Value&, Gtk::Button&);
+  WorkspaceButton& addButton(const Json::Value&);
+  void onButtonReady(const Json::Value&, WorkspaceButton&);
   std::string getIcon(const std::string&, const Json::Value&);
   std::string getCycleWorkspace(std::vector<Json::Value>::iterator, bool prev) const;
   uint16_t getWorkspaceIndex(const std::string& name) const;
@@ -60,7 +68,7 @@ class Workspaces : public AModule, public sigc::trackable {
   std::vector<std::regex> m_ignoreWorkspaces;
   util::RegexCollection m_windowRewriteRules;
   util::JsonParser parser_;
-  std::unordered_map<std::string, Gtk::Button> buttons_;
+  std::unordered_map<std::string, WorkspaceButton> buttons_;
   std::unordered_map<std::string, uint16_t> custom_sort_priorities_;
   std::mutex mutex_;
   Ipc ipc_;
