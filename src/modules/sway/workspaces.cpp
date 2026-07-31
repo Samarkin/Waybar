@@ -8,6 +8,10 @@
 
 namespace waybar::modules::sway {
 
+Gtk::Label& Workspaces::WorkspaceButton::labelWidget() {
+  return *static_cast<Gtk::Label*>(button.get_children()[0]);
+}
+
 // Helper function to assign a number to a workspace, just like sway. In fact
 // this is taken quite verbatim from `sway/ipc-json.c`.
 int Workspaces::convertWorkspaceNameToNum(const std::string& name) {
@@ -377,7 +381,8 @@ auto Workspaces::update() -> void {
     if (bit == buttons_.end()) {
       needReorder = true;
     }
-    auto& button = bit == buttons_.end() ? addButton(*it) : bit->second;
+    auto& ws = bit == buttons_.end() ? addButton(*it) : bit->second;
+    auto& button = ws.button;
     if (needReorder) {
       box_.reorder_child(button, it - workspaces_.begin());
     }
@@ -462,19 +467,20 @@ auto Workspaces::update() -> void {
     }
 
     if (!config_["disable-markup"].asBool()) {
-      static_cast<Gtk::Label*>(button.get_children()[0])->set_markup(full_name);
+      ws.labelWidget().set_markup(full_name);
     } else {
-      button.set_label(full_name);
+      ws.labelWidget().set_text(full_name);
     }
-    onButtonReady(*it, button);
+    onButtonReady(*it, ws);
   }
   // Call parent update
   AModule::update();
 }
 
-Gtk::Button& Workspaces::addButton(const Json::Value& node) {
+Workspaces::WorkspaceButton& Workspaces::addButton(const Json::Value& node) {
   auto pair = buttons_.emplace(node["name"].asString(), node["name"].asString());
-  auto&& button = pair.first->second;
+  auto& ws = pair.first->second;
+  auto& button = ws.button;
   box_.pack_start(button, false, false, 0);
   button.set_name("sway-workspace-" + node["name"].asString());
   button.set_relief(Gtk::RELIEF_NONE);
@@ -507,7 +513,7 @@ Gtk::Button& Workspaces::addButton(const Json::Value& node) {
       }
     });
   }
-  return button;
+  return ws;
 }
 
 std::string Workspaces::getIcon(const std::string& name, const Json::Value& node) {
@@ -669,15 +675,15 @@ bool is_focused_recursive(const Json::Value& node) {
   return false;
 }
 
-void Workspaces::onButtonReady(const Json::Value& node, Gtk::Button& button) {
+void Workspaces::onButtonReady(const Json::Value& node, WorkspaceButton& ws) {
   if (config_["current-only"].asBool()) {
     if (is_focused_recursive(node)) {
-      button.show();
+      ws.button.show();
     } else {
-      button.hide();
+      ws.button.hide();
     }
   } else {
-    button.show();
+    ws.button.show();
   }
 }
 
