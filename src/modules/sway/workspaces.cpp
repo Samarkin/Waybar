@@ -320,6 +320,28 @@ bool Workspaces::hasFlag(const Json::Value& node, const std::string& flag) {
   return false;
 }
 
+bool Workspaces::isWorkspaceEmpty(const Json::Value& node) {
+  return node["nodes"].empty() && node["floating_nodes"].empty();
+}
+
+// Sway sets "visible" on views, not on workspaces, and hasFlag recurses: a workspace
+// holding a visible view is the one displayed on its output. The second disjunct covers
+// the empty displayed workspace, which has no view to carry the flag.
+bool Workspaces::isWorkspaceVisible(const Json::Value& node) {
+  return hasFlag(node, "visible") || (node["output"].isString() && isWorkspaceEmpty(node));
+}
+
+// Whether a workspace is in the state named by a state-keyed format-icons entry.
+bool Workspaces::hasState(const Json::Value& node, const std::string& state) {
+  if (state == "visible") {
+    return isWorkspaceVisible(node);
+  }
+  if (state == "empty") {
+    return isWorkspaceEmpty(node);
+  }
+  return hasFlag(node, state);
+}
+
 void Workspaces::updateWindows(const Json::Value& node, std::string& windows) {
   if ((node["type"].asString() == "con" || node["type"].asString() == "floating_con") &&
       node["name"].isString()) {
@@ -359,13 +381,12 @@ auto Workspaces::update() -> void {
     if (needReorder) {
       box_.reorder_child(button, it - workspaces_.begin());
     }
-    bool noNodes = (*it)["nodes"].empty() && (*it)["floating_nodes"].empty();
     if (hasFlag((*it), "focused")) {
       button.get_style_context()->add_class("focused");
     } else {
       button.get_style_context()->remove_class("focused");
     }
-    if (hasFlag((*it), "visible") || ((*it)["output"].isString() && noNodes)) {
+    if (isWorkspaceVisible(*it)) {
       button.get_style_context()->add_class("visible");
     } else {
       button.get_style_context()->remove_class("visible");
@@ -380,7 +401,7 @@ auto Workspaces::update() -> void {
     } else {
       button.get_style_context()->remove_class("persistent");
     }
-    if (noNodes) {
+    if (isWorkspaceEmpty(*it)) {
       button.get_style_context()->add_class("empty");
     } else {
       button.get_style_context()->remove_class("empty");
@@ -490,7 +511,11 @@ Gtk::Button& Workspaces::addButton(const Json::Value& node) {
 }
 
 std::string Workspaces::getIcon(const std::string& name, const Json::Value& node) {
-  std::vector<std::string> keys = {"high-priority-named", "urgent", "focused", name, "default"};
+  // "empty" ranks above "visible": sway only keeps an empty workspace in the tree while it
+  // is the one displayed on its output, so every empty workspace is also visible and the
+  // opposite order would make the "empty" icon unreachable.
+  std::vector<std::string> keys = {
+      "high-priority-named", "urgent", "focused", "empty", "visible", name, "default"};
   for (auto const& key : keys) {
     if (key == "high-priority-named") {
       auto it = std::find_if(high_priority_named_.begin(), high_priority_named_.end(),
@@ -507,8 +532,8 @@ std::string Workspaces::getIcon(const std::string& name, const Json::Value& node
         return config_["format-icons"][trimWorkspaceName(name)].asString();
       }
     }
-    if (key == "focused" || key == "urgent") {
-      if (config_["format-icons"][key].isString() && hasFlag(node, key)) {
+    if (key == "focused" || key == "urgent" || key == "empty" || key == "visible") {
+      if (config_["format-icons"][key].isString() && hasState(node, key)) {
         return config_["format-icons"][key].asString();
       }
     } else if (config_["format-icons"]["persistent"].isString() &&

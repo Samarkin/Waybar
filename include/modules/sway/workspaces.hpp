@@ -38,6 +38,9 @@ class Workspaces : public AModule, public sigc::trackable {
   void onEvent(const struct Ipc::ipc_response&);
   bool filterButtons();
   static bool hasFlag(const Json::Value&, const std::string&);
+  static bool isWorkspaceEmpty(const Json::Value&);
+  static bool isWorkspaceVisible(const Json::Value&);
+  static bool hasState(const Json::Value&, const std::string&);
   void updateWindows(const Json::Value&, std::string&);
   Gtk::Button& addButton(const Json::Value&);
   void onButtonReady(const Json::Value&, Gtk::Button&);
