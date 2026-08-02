@@ -135,6 +135,74 @@ warp-on-scroll: ++
 	Keys are output names and values are class names like *${output}: {output-class}*.
 	Assignment in config is used to keep the stylesheet independent of the available outputs.
 
+*workspace-taskbar*: ++
+	typeof: object ++
+	Contains settings for the workspace taskbar, which renders the windows of each
+	workspace as buttons nested inside that workspace's button.
+	Note that this nesting makes the descendant selector *#workspaces button* match the
+	window buttons too; see *Style*.
+
+	*enable*: ++
+		typeof: bool ++
+		default: false ++
+		Enables the workspace taskbar mode. All other keys in this object are ignored when it is false.
+
+	*format*: ++
+		typeof: string ++
+		default: {icon} ++
+		The format of a single window button. See *WORKSPACE TASKBAR FORMAT REPLACEMENTS*.
+
+	*icon-size*: ++
+		typeof: int ++
+		default: 16 ++
+		The size of the window icons. Has no effect if *format* contains no *{icon}*, since no icon is loaded then.
+
+	*icon-theme*: ++
+		typeof: string|array ++
+		The names of the icon themes used to find an icon. The list is traversed from left to right. If omitted, the system default is used.
+
+	*app_ids-mapping*: ++
+		typeof: object ++
+		Dictionary of app_id to be replaced with. Applies to the X11 class as well, so that a remapping also fixes icon lookup for XWayland windows.
+
+	*ignore-list*: ++
+		typeof: array ++
+		default: [] ++
+		Regular expressions matched against each window's app_id, X11 class and title. A window matching any of them is not shown. An expression must match the whole value, so 'foo' is already an exact match and anchors are unnecessary. Matching is case-insensitive. Invalid expressions are logged and skipped.
+
+	*tooltip*: ++
+		typeof: bool ++
+		default: true ++
+		If set to false, no tooltip is shown on window buttons.
+
+	*tooltip-format*: ++
+		typeof: string ++
+		default: {title} ++
+		The format of a window button's tooltip.
+
+	*markup*: ++
+		typeof: bool ++
+		default: false ++
+		If set to true, pango markup is accepted in *format* and *tooltip-format*.
+
+	*rewrite*: ++
+		typeof: object ++
+		Rules to rewrite the window button output. See *WORKSPACE TASKBAR REWRITE RULES*.
+
+	*on-click*: ++
+		typeof: string ++
+		default: activate ++
+		The action triggered by left-clicking a window button. See *WORKSPACE TASKBAR CLICK ACTIONS*.
+
+	*on-click-middle*: ++
+		typeof: string ++
+		default: "" ++
+		The action triggered by middle-clicking a window button.
+
+	*on-click-right*: ++
+		typeof: string ++
+		default: "" ++
+		The action triggered by right-clicking a window button.
 
 # FORMAT REPLACEMENTS
 
@@ -149,6 +217,66 @@ warp-on-scroll: ++
 *{output}*: Output where the workspace is located.
 
 *{windows}*: Result from window-rewrite
+
+# WORKSPACE TASKBAR FORMAT REPLACEMENTS
+
+These are expanded once per window.
+
+*{name}*: The application name as in desktop file if appropriate desktop files are found, otherwise same as {app_id}
+
+*{title}*: The title of the window.
+
+*{app_id}*: The app_id of the application. For XWayland windows this is the X11 instance.
+
+*{state}*: The states the window is in, space separated, out of 'active', 'fullscreen' and 'urgent'. Empty when it is in none of them.
+
+*{short_state}*: The same states as a single letter each and no separator, so a focused fullscreen window yields 'AF'.
+
+*{icon}* is different: it marks where the application icon is placed, and is only
+recognised in *format*. Only the first occurrence acts as the marker. Using it in
+*tooltip-format*, or a second time in *format*, is an error that logs a warning and
+renders that text as empty.
+
+A length limit such as *{title:.15}* counts characters, not bytes, so it will not split a
+multi-byte character. When *markup* is true it can still cut through an XML entity that
+escaping introduced, which produces invalid markup.
+
+# WORKSPACE TASKBAR CLICK ACTIONS
+
+*activate*: Focus the window. Since focusing also switches to the window's workspace, this is a superset of clicking the workspace itself.
+
+*fullscreen*: Toggle the window's fullscreen state.
+
+*close*: Close the window.
+
+*minimize*, *minimize-raise* and *maximize* are recognised so that configurations written
+for a *wlr/taskbar* module keep loading, but sway has no equivalent, so they only log a
+warning.
+
+A window button handles the click itself, so clicking one never switches workspace the way
+clicking the surrounding workspace button does. Leaving an action empty means the click
+does nothing to the window either.
+
+# WORKSPACE TASKBAR REWRITE RULES
+
+*workspace-taskbar.rewrite* is an object where keys are regular expressions and values are
+rewrite rules if the expression matches. Rules may contain references to
+captures of the expression.
+
+Regular expression and replacement follow ECMA-script rules.
+
+An expression must match the expanded text *fully* to trigger its replacement. That text
+is matched in pieces rather than as the whole button: the parts of *format* before and
+after *{icon}* are rewritten separately, and *tooltip-format* is rewritten on its own.
+
+Any literal text in the format is part of what a rule has to match. With
+*"format": "{icon} {title}"* the piece after the icon still carries the leading space, so
+a rule like *"foo(.*)"* will not match it while *" foo(.*)"* will. The same applies when
+*markup* is true, where the surrounding tags are matched as well.
+
+If no expression matches, the text is left unchanged.
+
+Invalid expressions (e.g., mismatched parentheses) are skipped.
 
 # ICONS
 
@@ -210,6 +338,21 @@ n.b.: the list of outputs can be obtained from command line using *swaymsg -t ge
 
 ```
 "sway/workspaces": {
+	"format": "{name}",
+	"workspace-taskbar": {
+		"enable": true,
+		"icon-size": 16,
+		"format": "{icon}",
+		"tooltip-format": "{name} - {title}",
+		"on-click": "activate",
+		"on-click-middle": "close",
+		"ignore-list": ["^steam_app_.*"]
+	}
+}
+```
+
+```
+"sway/workspaces": {
   "format": "<span size='larger'>{name}</span> {windows}",
   "format-window-separator": " | ",
   "window-rewrite-default": "{name}",
@@ -239,3 +382,21 @@ n.b.: the list of outputs can be obtained from command line using *swaymsg -t ge
 - *#workspaces button.current_output*
 - *#workspaces button#sway-workspace-${name}*
 - *#workspaces button.${output-class}*
+The following are only present when *workspace-taskbar.enable* is true:
+
+- *#workspaces .workspace-label* (the workspace name)
+- *#workspaces .taskbar-window* (each window button)
+- *#workspaces .taskbar-window.active* (the focused window)
+
+Enabling *workspace-taskbar* nests widgets inside the workspace button, which changes what
+two kinds of existing selector match:
+
+- *#workspaces button* is a *descendant* selector, so it now also matches every window
+	button. Padding, borders or backgrounds set through it will be drawn around each
+	window as well as around the workspace. Restrict it with
+	*#workspaces > button*, or undo it again in *#workspaces .taskbar-window*.
+- *#workspaces button > label* no longer matches the workspace name, because the label is
+	now inside a box rather than a direct child of the button. Use
+	*#workspaces .workspace-label* instead.
+
+The state classes on the workspace button itself are unaffected.
