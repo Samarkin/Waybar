@@ -4,9 +4,256 @@
 
 #include <algorithm>
 #include <cctype>
+#include <memory>
+#include <sstream>
 #include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "util/rewrite_string.hpp"
+#include "util/sanitize_str.hpp"
+#include "util/string.hpp"
 
 namespace waybar::modules::sway {
+
+namespace {
+
+// Returns {app_id, app_class} for a view. Native Wayland views carry an `app_id`; XWayland
+// views instead carry the X11 `instance` and `class` hints. The instance is used as the
+// displayed app_id (as sway/window does), but the class is carried along because it is the
+// identifier icon lookup actually needs: X11 Firefox reports instance "Navigator" and
+// class "firefox".
+std::pair<std::string, std::string> resolve_app_id(
+    const Json::Value& node, const std::map<std::string, std::string>& replace_map) {
+  std::string app_id;
+  std::string app_class;
+  if (node["window_properties"]["class"].isString()) {
+    app_class = node["window_properties"]["class"].asString();
+  }
+  if (node["app_id"].isString()) {
+    app_id = node["app_id"].asString();
+  } else if (node["window_properties"]["instance"].isString()) {
+    app_id = node["window_properties"]["instance"].asString();
+  } else {
+    app_id = app_class;
+  }
+
+  const auto replace = [&replace_map](std::string& value) {
+    const auto it = replace_map.find(value);
+    if (it != replace_map.end()) {
+      value = it->second;
+    }
+  };
+  replace(app_id);
+  replace(app_class);
+  return {app_id, app_class};
+}
+
+// A view with no children of its own. Unlike the predicate updateWindows() uses, this
+// matches nameless views but not named containers.
+bool is_leaf_view(const Json::Value& node) {
+  const auto type = node["type"].asString();
+  return (type == "con" || type == "floating_con") && node["nodes"].empty() &&
+         node["floating_nodes"].empty();
+}
+
+bool is_window_ignored(const std::vector<std::regex>& ignore_list, const WorkspaceWindow& window) {
+  return std::any_of(ignore_list.begin(), ignore_list.end(), [&window](const std::regex& rule) {
+    return std::regex_match(window.app_id, rule) || std::regex_match(window.app_class, rule) ||
+           std::regex_match(window.title, rule);
+  });
+}
+
+}  // namespace
+
+WorkspaceWindowButton::WorkspaceWindowButton(Workspaces& owner, Gtk::Orientation orientation,
+                                             const WorkspaceWindow& window)
+    : owner_(owner), id_(window.id), content_(orientation, 0) {
+  button_.set_relief(Gtk::RELIEF_NONE);
+  button_.get_style_context()->add_class("taskbar-window");
+
+  content_.add(text_before_);
+  content_.add(icon_);
+  content_.add(text_after_);
+  content_.show();
+  button_.add(content_);
+
+  button_.signal_button_release_event().connect(
+      sigc::mem_fun(*this, &WorkspaceWindowButton::handleClicked), false);
+
+  setData(window);
+}
+
+std::string WorkspaceWindowButton::stateString(bool shortened) const {
+  std::stringstream ss;
+  if (shortened) {
+    ss << (focused_ ? "A" : "") << (fullscreen_ ? "F" : "") << (urgent_ ? "U" : "");
+  } else {
+    ss << (focused_ ? "active " : "") << (fullscreen_ ? "fullscreen " : "")
+       << (urgent_ ? "urgent " : "");
+  }
+
+  std::string res = ss.str();
+  if (shortened || res.empty()) {
+    return res;
+  }
+  return res.substr(0, res.size() - 1);
+}
+
+void WorkspaceWindowButton::setData(const WorkspaceWindow& window) {
+  // The desktop entry and the icon are keyed on the identifiers alone, so they are only
+  // re-resolved when those actually change. Titles change on every page navigation or
+  // shell command; re-scanning desktop files for those would cost a lookup per keystroke.
+  const bool identity_changed =
+      !app_info_resolved_ || app_id_ != window.app_id || app_class_ != window.app_class;
+
+  title_ = window.title;
+  app_id_ = window.app_id;
+  app_class_ = window.app_class;
+  focused_ = window.focused;
+  fullscreen_ = window.fullscreen;
+  urgent_ = window.urgent;
+
+  if (!identity_changed) {
+    return;
+  }
+  app_info_resolved_ = true;
+
+  app_info_ = owner_.resolveAppInfo(app_id_, app_class_);
+  name_ = app_info_ ? app_info_->get_display_name() : app_id_;
+  // Loading the icon is left to render(), which runs once the button has a parent and so
+  // can read the right scale factor for the output the bar is on.
+  icon_dirty_ = owner_.taskbarConfig().with_icon;
+}
+
+std::string WorkspaceWindowButton::formatText(const std::string& format,
+                                              const FormatArgs& args) const {
+  try {
+    return fmt::format(fmt::runtime(format), fmt::arg("title", args.title),
+                       fmt::arg("name", args.name), fmt::arg("app_id", args.app_id),
+                       fmt::arg("state", args.state), fmt::arg("short_state", args.short_state));
+  } catch (const std::exception& e) {
+    owner_.warnTaskbarFormat(format, e.what());
+    return {};
+  }
+}
+
+void WorkspaceWindowButton::render() {
+  const auto& config = owner_.taskbarConfig();
+
+  if (icon_dirty_) {
+    icon_dirty_ = false;
+    if (owner_.iconLoader().image_load_icon(icon_, app_info_, config.icon_size)) {
+      icon_.show();
+    } else {
+      icon_.hide();
+      spdlog::debug("Couldn't find icon for {}", app_id_);
+    }
+  }
+
+  FormatArgs args{title_, name_, app_id_, stateString(false), stateString(true)};
+  if (config.markup) {
+    args.title = util::sanitize_string(args.title);
+    args.name = util::sanitize_string(args.name);
+    args.app_id = util::sanitize_string(args.app_id);
+  }
+
+  const auto write = [&](Gtk::Label& label, const std::string& format) {
+    if (format.empty()) {
+      label.hide();
+      return;
+    }
+    auto text = util::rewriteString(formatText(format, args), config.rewrite);
+    if (config.markup) {
+      label.set_markup(text);
+    } else {
+      label.set_text(text);
+    }
+    // An empty expansion (a bad format, or a rewrite rule mapping to "") would otherwise
+    // leave a zero-width label parented for no reason.
+    if (text.empty()) {
+      label.hide();
+    } else {
+      label.show();
+    }
+  };
+  write(text_before_, config.format_before);
+  write(text_after_, config.format_after);
+
+  if (!config.format_tooltip.empty()) {
+    auto text = util::rewriteString(formatText(config.format_tooltip, args), config.rewrite);
+    if (config.markup) {
+      button_.set_tooltip_markup(text);
+    } else {
+      button_.set_tooltip_text(text);
+    }
+  }
+
+  if (focused_) {
+    button_.get_style_context()->add_class("active");
+  } else {
+    button_.get_style_context()->remove_class("active");
+  }
+}
+
+bool WorkspaceWindowButton::handleClicked(GdkEventButton* event) {
+  const auto& config = owner_.taskbarConfig();
+  std::string action;
+  if (event->button == 1) {
+    action = config.on_click;
+  } else if (event->button == 2) {
+    action = config.on_click_middle;
+  } else if (event->button == 3) {
+    action = config.on_click_right;
+  }
+
+  if (action.empty()) {
+    return true;
+  }
+
+  try {
+    if (action == "activate") {
+      owner_.ipc().sendCmd(IPC_COMMAND, fmt::format("[con_id={}] focus", id_));
+    } else if (action == "close") {
+      owner_.ipc().sendCmd(IPC_COMMAND, fmt::format("[con_id={}] kill", id_));
+    } else if (action == "fullscreen") {
+      owner_.ipc().sendCmd(IPC_COMMAND, fmt::format("[con_id={}] fullscreen toggle", id_));
+    } else if (action == "minimize" || action == "minimize-raise" || action == "maximize") {
+      spdlog::warn("{} is not supported on sway", action);
+    } else {
+      spdlog::warn("Unknown action {}", action);
+    }
+  } catch (const std::exception& e) {
+    spdlog::error("Workspaces: {}", e.what());
+  }
+
+  // A nested button consumes the whole click sequence, so the workspace button's own
+  // handler never runs for clicks landing here -- including when no action is configured.
+  return true;
+}
+
+Workspaces::WorkspaceButton::WorkspaceButton(const std::string& name, bool taskbar_enabled,
+                                             Gtk::Orientation orientation)
+    : content(orientation, 0), label(name), taskbar(orientation, 0), taskbar_mode(taskbar_enabled) {
+  if (!taskbar_mode) {
+    // Let the button create its own child label, so that "#workspaces button > label" and
+    // friends keep matching. content/label/taskbar stay unparented and unused.
+    button.set_label(name);
+    return;
+  }
+  label.get_style_context()->add_class("workspace-label");
+  content.pack_start(label, false, false, 0);
+  content.pack_start(taskbar, false, false, 0);
+  button.add(content);
+  content.show();
+  label.show();
+  taskbar.show();
+}
+
+Gtk::Label& Workspaces::WorkspaceButton::labelWidget() {
+  return taskbar_mode ? label : *static_cast<Gtk::Label*>(button.get_children()[0]);
+}
 
 // Helper function to assign a number to a workspace, just like sway. In fact
 // this is taken quite verbatim from `sway/ipc-json.c`.
@@ -85,6 +332,7 @@ Workspaces::Workspaces(const std::string& id, const Bar& bar, const Json::Value&
         windowRewrite, std::move(windowRewriteDefault), windowRewritePriorityFunction);
   }
   populateIgnoreWorkspacesConfig(config);
+  populateWorkspaceTaskbarConfig(config);
   ipc_.subscribe(R"(["workspace"])");
   ipc_.subscribe(R"(["window"])");
   ipc_.signal_event.connect(sigc::mem_fun(*this, &Workspaces::onEvent));
@@ -129,6 +377,175 @@ auto Workspaces::populateIgnoreWorkspacesConfig(const Json::Value& config) -> vo
         spdlog::error("Not a string: '{}'", workspaceRegex);
       }
     }
+  }
+}
+
+auto Workspaces::populateWorkspaceTaskbarConfig(const Json::Value& config) -> void {
+  const Json::Value& taskbar = config["workspace-taskbar"];
+  if (!taskbar.isObject()) {
+    return;
+  }
+
+  taskbar_config_.enable = taskbar["enable"].isBool() && taskbar["enable"].asBool();
+  if (!taskbar_config_.enable) {
+    return;
+  }
+
+  if (taskbar["format"].isString()) {
+    auto parts = split(taskbar["format"].asString(), "{icon}", 1);
+    taskbar_config_.format_before = parts[0];
+    if (parts.size() > 1) {
+      taskbar_config_.with_icon = true;
+      taskbar_config_.format_after = parts[1];
+    }
+  } else {
+    // The default is to only show the icon.
+    taskbar_config_.with_icon = true;
+  }
+
+  if (!taskbar["tooltip"].isBool() || taskbar["tooltip"].asBool()) {
+    taskbar_config_.format_tooltip =
+        taskbar["tooltip-format"].isString() ? taskbar["tooltip-format"].asString() : "{title}";
+  }
+
+  if (taskbar["icon-size"].isInt()) {
+    taskbar_config_.icon_size = taskbar["icon-size"].asInt();
+  }
+  taskbar_config_.markup = taskbar["markup"].isBool() && taskbar["markup"].asBool();
+  taskbar_config_.rewrite = taskbar["rewrite"];
+
+  if (taskbar["icon-theme"].isArray()) {
+    for (const auto& theme : taskbar["icon-theme"]) {
+      if (theme.isString()) {
+        icon_loader_.add_custom_icon_theme(theme.asString());
+      } else {
+        spdlog::error("Not a string: '{}'", theme);
+      }
+    }
+  } else if (taskbar["icon-theme"].isString()) {
+    icon_loader_.add_custom_icon_theme(taskbar["icon-theme"].asString());
+  }
+
+  if (taskbar["ignore-list"].isArray()) {
+    for (const auto& rule : taskbar["ignore-list"]) {
+      if (!rule.isString()) {
+        spdlog::error("Not a string: '{}'", rule);
+        continue;
+      }
+      try {
+        taskbar_config_.ignore_list.emplace_back(rule.asString(), std::regex_constants::icase);
+      } catch (const std::regex_error& e) {
+        spdlog::error("Invalid rule {}: {}", rule.asString(), e.what());
+      }
+    }
+  }
+
+  if (taskbar["app_ids-mapping"].isObject()) {
+    const Json::Value& mapping = taskbar["app_ids-mapping"];
+    for (const auto& app_id : mapping.getMemberNames()) {
+      if (mapping[app_id].isString()) {
+        taskbar_config_.app_ids_replace.emplace(app_id, mapping[app_id].asString());
+      } else {
+        spdlog::error("Not a string: '{}'", mapping[app_id]);
+      }
+    }
+  }
+
+  // These keys are nested, so AModule (which only scans top-level keys) never sees them and
+  // will not also run them as shell commands. A top-level "on-click" on the module keeps
+  // behaving as a command, unchanged.
+  const auto read_action = [&taskbar](const char* key, std::string& out) {
+    if (taskbar[key].isString()) {
+      out = taskbar[key].asString();
+    }
+  };
+  read_action("on-click", taskbar_config_.on_click);
+  read_action("on-click-middle", taskbar_config_.on_click_middle);
+  read_action("on-click-right", taskbar_config_.on_click_right);
+}
+
+void Workspaces::collectWindows(const Json::Value& node, const WorkspaceTaskbarConfig& config,
+                                std::vector<WorkspaceWindow>& windows) {
+  if (is_leaf_view(node)) {
+    WorkspaceWindow window;
+    window.id = node["id"].asInt64();
+    window.title = node["name"].isString() ? node["name"].asString() : "";
+    std::tie(window.app_id, window.app_class) = resolve_app_id(node, config.app_ids_replace);
+    window.focused = node["focused"].asBool();
+    window.fullscreen = node["fullscreen_mode"].asInt() != 0;
+    window.urgent = node["urgent"].asBool();
+    if (!is_window_ignored(config.ignore_list, window)) {
+      windows.push_back(std::move(window));
+    }
+    return;
+  }
+
+  for (const Json::Value& child : node["nodes"]) {
+    collectWindows(child, config, windows);
+  }
+  for (const Json::Value& child : node["floating_nodes"]) {
+    collectWindows(child, config, windows);
+  }
+}
+
+Glib::RefPtr<Gio::DesktopAppInfo> Workspaces::resolveAppInfo(const std::string& app_id,
+                                                             const std::string& app_class) {
+  const auto key = std::make_pair(app_id, app_class);
+  if (const auto it = app_info_cache_.find(key); it != app_info_cache_.end()) {
+    return it->second;
+  }
+
+  auto app_info = IconLoader::get_app_info_from_app_id_list(app_id);
+  if (!app_info && !app_class.empty() && app_class != app_id) {
+    // XWayland views report the instance as their app_id, which rarely names a desktop
+    // entry; the class usually does.
+    app_info = IconLoader::get_app_info_from_app_id_list(app_class);
+  }
+  app_info_cache_.emplace(key, app_info);
+  return app_info;
+}
+
+void Workspaces::warnTaskbarFormat(const std::string& format, const std::string& error) {
+  if (taskbar_format_warned_) {
+    return;
+  }
+  taskbar_format_warned_ = true;
+  spdlog::warn("Workspaces: invalid workspace-taskbar format '{}': {}", format, error);
+}
+
+void Workspaces::updateWorkspaceTaskbar(WorkspaceButton& ws, const std::string& name) {
+  static const std::vector<WorkspaceWindow> kNoWindows;
+  const auto it = workspace_windows_.find(name);
+  const auto& windows = it == workspace_windows_.end() ? kNoWindows : it->second;
+
+  // Drop the buttons of windows that are gone; ~Gtk::Button unparents them from `taskbar`.
+  std::erase_if(ws.windows, [&windows](const std::unique_ptr<WorkspaceWindowButton>& button) {
+    return std::none_of(windows.begin(), windows.end(), [&button](const WorkspaceWindow& window) {
+      return window.id == button->id();
+    });
+  });
+
+  int position = 0;
+  for (const auto& window : windows) {
+    auto existing = std::find_if(ws.windows.begin(), ws.windows.end(),
+                                 [&window](const std::unique_ptr<WorkspaceWindowButton>& button) {
+                                   return button->id() == window.id;
+                                 });
+
+    WorkspaceWindowButton* button = nullptr;
+    if (existing == ws.windows.end()) {
+      ws.windows.push_back(
+          std::make_unique<WorkspaceWindowButton>(*this, bar_.orientation, window));
+      button = ws.windows.back().get();
+      ws.taskbar.pack_start(button->widget(), false, false, 0);
+      button->widget().show();
+    } else {
+      button = existing->get();
+      button->setData(window);
+    }
+
+    ws.taskbar.reorder_child(button->widget(), position++);
+    button->render();
   }
 }
 
@@ -277,6 +694,14 @@ void Workspaces::onCmd(const struct Ipc::ipc_response& res) {
 
                     return l < r;
                   });
+
+        workspace_windows_.clear();
+        if (taskbar_config_.enable) {
+          for (const auto& workspace : workspaces_) {
+            collectWindows(workspace, taskbar_config_,
+                           workspace_windows_[workspace["name"].asString()]);
+          }
+        }
       }
       dp.emit();
     } catch (const std::exception& e) {
@@ -320,6 +745,28 @@ bool Workspaces::hasFlag(const Json::Value& node, const std::string& flag) {
   return false;
 }
 
+bool Workspaces::isWorkspaceEmpty(const Json::Value& node) {
+  return node["nodes"].empty() && node["floating_nodes"].empty();
+}
+
+// Sway sets "visible" on views, not on workspaces, and hasFlag recurses: a workspace
+// holding a visible view is the one displayed on its output. The second disjunct covers
+// the empty displayed workspace, which has no view to carry the flag.
+bool Workspaces::isWorkspaceVisible(const Json::Value& node) {
+  return hasFlag(node, "visible") || (node["output"].isString() && isWorkspaceEmpty(node));
+}
+
+// Whether a workspace is in the state named by a state-keyed format-icons entry.
+bool Workspaces::hasState(const Json::Value& node, const std::string& state) {
+  if (state == "visible") {
+    return isWorkspaceVisible(node);
+  }
+  if (state == "empty") {
+    return isWorkspaceEmpty(node);
+  }
+  return hasFlag(node, state);
+}
+
 void Workspaces::updateWindows(const Json::Value& node, std::string& windows) {
   if ((node["type"].asString() == "con" || node["type"].asString() == "floating_con") &&
       node["name"].isString()) {
@@ -355,17 +802,17 @@ auto Workspaces::update() -> void {
     if (bit == buttons_.end()) {
       needReorder = true;
     }
-    auto& button = bit == buttons_.end() ? addButton(*it) : bit->second;
+    auto& ws = bit == buttons_.end() ? addButton(*it) : bit->second;
+    auto& button = ws.button;
     if (needReorder) {
       box_.reorder_child(button, it - workspaces_.begin());
     }
-    bool noNodes = (*it)["nodes"].empty() && (*it)["floating_nodes"].empty();
     if (hasFlag((*it), "focused")) {
       button.get_style_context()->add_class("focused");
     } else {
       button.get_style_context()->remove_class("focused");
     }
-    if (hasFlag((*it), "visible") || ((*it)["output"].isString() && noNodes)) {
+    if (isWorkspaceVisible(*it)) {
       button.get_style_context()->add_class("visible");
     } else {
       button.get_style_context()->remove_class("visible");
@@ -380,7 +827,7 @@ auto Workspaces::update() -> void {
     } else {
       button.get_style_context()->remove_class("persistent");
     }
-    if (noNodes) {
+    if (isWorkspaceEmpty(*it)) {
       button.get_style_context()->add_class("empty");
     } else {
       button.get_style_context()->remove_class("empty");
@@ -441,19 +888,25 @@ auto Workspaces::update() -> void {
     }
 
     if (!config_["disable-markup"].asBool()) {
-      static_cast<Gtk::Label*>(button.get_children()[0])->set_markup(full_name);
+      ws.labelWidget().set_markup(full_name);
     } else {
-      button.set_label(full_name);
+      ws.labelWidget().set_text(full_name);
     }
-    onButtonReady(*it, button);
+    onButtonReady(*it, ws);
+    if (taskbar_config_.enable) {
+      updateWorkspaceTaskbar(ws, (*it)["name"].asString());
+    }
   }
   // Call parent update
   AModule::update();
 }
 
-Gtk::Button& Workspaces::addButton(const Json::Value& node) {
-  auto pair = buttons_.emplace(node["name"].asString(), node["name"].asString());
-  auto&& button = pair.first->second;
+Workspaces::WorkspaceButton& Workspaces::addButton(const Json::Value& node) {
+  auto pair = buttons_.emplace(
+      std::piecewise_construct, std::forward_as_tuple(node["name"].asString()),
+      std::forward_as_tuple(node["name"].asString(), taskbar_config_.enable, bar_.orientation));
+  auto& ws = pair.first->second;
+  auto& button = ws.button;
   box_.pack_start(button, false, false, 0);
   button.set_name("sway-workspace-" + node["name"].asString());
   button.set_relief(Gtk::RELIEF_NONE);
@@ -486,11 +939,15 @@ Gtk::Button& Workspaces::addButton(const Json::Value& node) {
       }
     });
   }
-  return button;
+  return ws;
 }
 
 std::string Workspaces::getIcon(const std::string& name, const Json::Value& node) {
-  std::vector<std::string> keys = {"high-priority-named", "urgent", "focused", name, "default"};
+  // "empty" ranks above "visible": sway only keeps an empty workspace in the tree while it
+  // is the one displayed on its output, so every empty workspace is also visible and the
+  // opposite order would make the "empty" icon unreachable.
+  std::vector<std::string> keys = {
+      "high-priority-named", "urgent", "focused", "empty", "visible", name, "default"};
   for (auto const& key : keys) {
     if (key == "high-priority-named") {
       auto it = std::find_if(high_priority_named_.begin(), high_priority_named_.end(),
@@ -507,8 +964,8 @@ std::string Workspaces::getIcon(const std::string& name, const Json::Value& node
         return config_["format-icons"][trimWorkspaceName(name)].asString();
       }
     }
-    if (key == "focused" || key == "urgent") {
-      if (config_["format-icons"][key].isString() && hasFlag(node, key)) {
+    if (key == "focused" || key == "urgent" || key == "empty" || key == "visible") {
+      if (config_["format-icons"][key].isString() && hasState(node, key)) {
         return config_["format-icons"][key].asString();
       }
     } else if (config_["format-icons"]["persistent"].isString() &&
@@ -644,15 +1101,15 @@ bool is_focused_recursive(const Json::Value& node) {
   return false;
 }
 
-void Workspaces::onButtonReady(const Json::Value& node, Gtk::Button& button) {
+void Workspaces::onButtonReady(const Json::Value& node, WorkspaceButton& ws) {
   if (config_["current-only"].asBool()) {
     if (is_focused_recursive(node)) {
-      button.show();
+      ws.button.show();
     } else {
-      button.hide();
+      ws.button.hide();
     }
   } else {
-    button.show();
+    ws.button.show();
   }
 }
 
